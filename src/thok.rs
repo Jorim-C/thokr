@@ -1,5 +1,4 @@
 use crate::util::std_dev;
-use crate::TICK_RATE_MS;
 use chrono::prelude::*;
 use directories::ProjectDirs;
 use itertools::Itertools;
@@ -29,8 +28,8 @@ pub struct Thok {
     pub wpm_coords: Vec<(f64, f64)>,
     pub cursor_pos: usize,
     pub started_at: Option<SystemTime>,
-    pub seconds_remaining: Option<f64>,
-    pub number_of_secs: Option<f64>,
+    pub milliseconds_remaining: Option<i64>,
+    pub number_of_secs: Option<i64>,
     pub number_of_words: usize,
     pub wpm: f64,
     pub accuracy: f64,
@@ -38,7 +37,7 @@ pub struct Thok {
 }
 
 impl Thok {
-    pub fn new(prompt: String, number_of_words: usize, number_of_secs: Option<f64>) -> Self {
+    pub fn new(prompt: String, number_of_words: usize, number_of_secs: Option<i64>) -> Self {
         Self {
             prompt,
             input: vec![],
@@ -48,16 +47,15 @@ impl Thok {
             started_at: None,
             number_of_secs,
             number_of_words,
-            seconds_remaining: number_of_secs,
+            milliseconds_remaining: number_of_secs.map(|seconds| seconds.saturating_mul(1000)),
             wpm: 0.0,
             accuracy: 0.0,
             std_dev: 0.0,
         }
     }
 
-    pub fn on_tick(&mut self) {
-        self.seconds_remaining =
-            Some(self.seconds_remaining.unwrap() - (TICK_RATE_MS as f64 / 1000_f64));
+    pub fn set_milliseconds_remaining(&mut self, milliseconds_remaining: i64) {
+        self.milliseconds_remaining = Some(milliseconds_remaining);
     }
 
     pub fn get_expected_char(&self, idx: usize) -> char {
@@ -190,7 +188,8 @@ impl Thok {
 
     pub fn has_finished(&self) -> bool {
         (self.input.len() == self.prompt.len())
-            || (self.seconds_remaining.is_some() && self.seconds_remaining.unwrap() <= 0.0)
+            || (self.milliseconds_remaining.is_some()
+                && self.milliseconds_remaining.unwrap() <= 0)
     }
 
     pub fn save_results(&self) -> io::Result<()> {
@@ -224,7 +223,7 @@ impl Thok {
                 Local::now().format("%c"),
                 self.number_of_words,
                 self.number_of_secs
-                    .map_or(String::from(""), |ns| format!("{:.2}", ns)),
+                    .map_or(String::from(""), |ns| format!("{:.2}", ns as f64)),
                 elapsed_secs,
                 self.wpm,      // already rounded, no need to round to two decimal places
                 self.accuracy, // already rounded, no need to round to two decimal places

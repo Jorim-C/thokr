@@ -25,6 +25,7 @@ use tui::{
 use webbrowser::Browser;
 
 const TICK_RATE_MS: u64 = 100;
+const TIMER_STOP_DELAY_SECS: u64 = 5;
 
 /// sleek typing tui with visualized results and historical logging
 #[derive(Parser, Debug, Clone)]
@@ -40,7 +41,7 @@ pub struct Cli {
 
     /// number of seconds to run test
     #[clap(short = 's', long)]
-    number_of_secs: Option<usize>,
+    number_of_secs: Option<i64>,
 
     /// custom prompt to use
     #[clap(short = 'p', long)]
@@ -68,6 +69,7 @@ impl SupportedLanguage {
 struct App {
     cli: Option<Cli>,
     thok: Thok,
+    timer_id: u64,
 }
 
 impl App {
@@ -88,22 +90,25 @@ impl App {
         };
         if cli.number_of_sentences.is_some() {
             Self {
-                thok: Thok::new(prompt, count, cli.number_of_secs.map(|ns| ns as f64)),
+                thok: Thok::new(prompt, count, cli.number_of_secs),
                 cli: Some(cli),
+                timer_id: 0,
             }
         } else {
             Self {
                 thok: Thok::new(
                     prompt,
                     cli.number_of_words,
-                    cli.number_of_secs.map(|ns| ns as f64),
+                    cli.number_of_secs,
                 ),
                 cli: Some(cli),
+                timer_id: 0,
             }
         }
     }
 
     fn reset(&mut self, new_prompt: Option<String>) {
+        self.timer_id = self.timer_id.wrapping_add(1);
         let cli = self.cli.clone().unwrap();
         let mut count = 0;
         let prompt = match new_prompt {
@@ -123,12 +128,12 @@ impl App {
             },
         };
         if cli.number_of_sentences.is_some() {
-            self.thok = Thok::new(prompt, count, cli.number_of_secs.map(|ns| ns as f64));
+            self.thok = Thok::new(prompt, count, cli.number_of_secs);
         } else {
             self.thok = Thok::new(
                 prompt,
                 cli.number_of_words,
-                cli.number_of_secs.map(|ns| ns as f64),
+                cli.number_of_secs,
             );
         }
     }
@@ -168,11 +173,7 @@ fn start_tui<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: &mut App,
 ) -> Result<(), Box<dyn Error>> {
-    let cli = app.cli.clone();
-
-    let should_tick = cli.unwrap().number_of_secs.unwrap_or(0) > 0;
-
-    let thok_events = get_thok_events(should_tick);
+    let (thok_events, timer_commands) = get_thok_events();
 
     loop {
         let mut exit_type: ExitType = ExitType::Quit;
@@ -182,13 +183,30 @@ fn start_tui<B: Backend>(
             let app = &mut app;
 
             match thok_events.recv()? {
-                ThokEvent::Tick => {
-                    if app.thok.has_started() && !app.thok.has_finished() {
-                        app.thok.on_tick();
+                ThokEvent::Timer {
+                    timer_id,
+                    milliseconds_remaining,
+                } => {
+                    if timer_id == app.timer_id
+                        && app.thok.has_started()
+                        && !app.thok.has_finished()
+                    {
+                        app.thok.set_milliseconds_remaining(milliseconds_remaining);
 
                         if app.thok.has_finished() {
                             app.thok.calc_results();
                         }
+                        terminal.draw(|f| ui(app, f))?;
+                    }
+                }
+                ThokEvent::TimerExpired { timer_id } => {
+                    if timer_id == app.timer_id
+                        && app.thok.has_started()
+                        && !app.thok.has_finished()
+                    {
+                        thread::sleep(Duration::from_secs(TIMER_STOP_DELAY_SECS));
+                        app.thok.set_milliseconds_remaining(0);
+                        app.thok.calc_results();
                         terminal.draw(|f| ui(app, f))?;
                     }
                 }
@@ -223,9 +241,22 @@ fn start_tui<B: Backend>(
 
                             match app.thok.has_finished() {
                                 false => {
+                                    let had_started = app.thok.has_started();
                                     app.thok.write(c);
+                                    if !had_started {
+                                        if let Some(milliseconds) = app.thok.milliseconds_remaining {
+                                            let _ = timer_commands.send(TimerCommand::Start {
+                                                timer_id: app.timer_id,
+                                                milliseconds,
+                                            });
+                                            drop(thok_events);
+                                            thread::sleep(Duration::from_millis(TICK_RATE_MS * 2));
+                                            return Ok(());
+                                        }
+                                    }
                                     if app.thok.has_finished() {
                                         app.thok.calc_results();
+                                        let _ = timer_commands.send(TimerCommand::Stop);
                                     }
                                 }
                                 true => match key.code {
@@ -254,6 +285,10 @@ fn start_tui<B: Backend>(
             }
         }
 
+        if app.thok.has_started() && !app.thok.has_finished() {
+            thread::sleep(Duration::from_secs(TIMER_STOP_DELAY_SECS));
+        }
+        let _ = timer_commands.send(TimerCommand::Stop);
         match exit_type {
             ExitType::Restart => {
                 app.reset(Some(app.thok.prompt.clone()));
@@ -274,22 +309,59 @@ fn start_tui<B: Backend>(
 enum ThokEvent {
     Key(KeyEvent),
     Resize,
-    Tick,
+    Timer {
+        timer_id: u64,
+        milliseconds_remaining: i64,
+    },
+    TimerExpired {
+        timer_id: u64,
+    },
 }
 
-fn get_thok_events(should_tick: bool) -> mpsc::Receiver<ThokEvent> {
-    let (tx, rx) = mpsc::channel();
+enum TimerCommand {
+    Start { timer_id: u64, milliseconds: i64 },
+    Stop,
+}
 
-    if should_tick {
-        let tick_x = tx.clone();
-        thread::spawn(move || loop {
-            if tick_x.send(ThokEvent::Tick).is_err() {
-                break;
+fn get_thok_events() -> (mpsc::Receiver<ThokEvent>, mpsc::Sender<TimerCommand>) {
+    let (event_tx, event_rx) = mpsc::channel();
+    let (timer_tx, timer_rx) = mpsc::channel();
+
+    let timer_events = event_tx.clone();
+    thread::spawn(move || {
+        let mut active_timer = None;
+
+        loop {
+            match timer_rx.recv_timeout(Duration::from_millis(TICK_RATE_MS)) {
+                Ok(TimerCommand::Start {
+                    timer_id,
+                    milliseconds,
+                }) => active_timer = Some((timer_id, milliseconds)),
+                Ok(TimerCommand::Stop) => active_timer = None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some((timer_id, milliseconds)) = active_timer {
+                        let remaining = milliseconds.saturating_sub(TICK_RATE_MS as i64);
+                        if remaining == 0 {
+                            timer_events
+                                .send(ThokEvent::TimerExpired { timer_id })
+                                .unwrap();
+                            thread::sleep(Duration::from_secs(TIMER_STOP_DELAY_SECS));
+                            active_timer = None;
+                        } else {
+                            timer_events
+                                .send(ThokEvent::Timer {
+                                    timer_id,
+                                    milliseconds_remaining: remaining,
+                                })
+                                .unwrap();
+                            active_timer = Some((timer_id, remaining));
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-
-            thread::sleep(Duration::from_millis(TICK_RATE_MS))
-        });
-    }
+        }
+    });
 
     thread::spawn(move || loop {
         let evt = match event::read().unwrap() {
@@ -298,12 +370,12 @@ fn get_thok_events(should_tick: bool) -> mpsc::Receiver<ThokEvent> {
             _ => None,
         };
 
-        if evt.is_some() && tx.send(evt.unwrap()).is_err() {
+        if evt.is_some() && event_tx.send(evt.unwrap()).is_err() {
             break;
         }
     });
 
-    rx
+    (event_rx, timer_tx)
 }
 
 fn ui<B: Backend>(app: &mut App, f: &mut Frame<B>) {
