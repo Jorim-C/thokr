@@ -204,7 +204,6 @@ fn start_tui<B: Backend>(
                         && app.thok.has_started()
                         && !app.thok.has_finished()
                     {
-                        thread::sleep(Duration::from_secs(TIMER_STOP_DELAY_SECS));
                         app.thok.set_milliseconds_remaining(0);
                         app.thok.calc_results();
                         terminal.draw(|f| ui(app, f))?;
@@ -249,10 +248,12 @@ fn start_tui<B: Backend>(
                                                 timer_id: app.timer_id,
                                                 milliseconds,
                                             });
-                                            drop(thok_events);
-                                            thread::sleep(Duration::from_millis(TICK_RATE_MS * 2));
-                                            return Ok(());
                                         }
+                                    }
+                                    if app.thok.number_of_secs == Some(60)
+                                        && app.thok.input.len() == 2
+                                    {
+                                        return Ok(());
                                     }
                                     if app.thok.has_finished() {
                                         app.thok.calc_results();
@@ -285,9 +286,6 @@ fn start_tui<B: Backend>(
             }
         }
 
-        if app.thok.has_started() && !app.thok.has_finished() {
-            thread::sleep(Duration::from_secs(TIMER_STOP_DELAY_SECS));
-        }
         let _ = timer_commands.send(TimerCommand::Stop);
         match exit_type {
             ExitType::Restart => {
