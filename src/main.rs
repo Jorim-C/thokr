@@ -173,7 +173,7 @@ fn start_tui<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: &mut App,
 ) -> Result<(), Box<dyn Error>> {
-    let (thok_events, timer_commands) = get_thok_events();
+    let (thok_events, timer_commands, timer_thread) = get_thok_events();
 
     loop {
         let mut exit_type: ExitType = ExitType::Quit;
@@ -253,6 +253,8 @@ fn start_tui<B: Backend>(
                                     if app.thok.number_of_secs == Some(60)
                                         && app.thok.input.len() == 2
                                     {
+                                        drop(thok_events);
+                                        timer_thread.join().unwrap();
                                         return Ok(());
                                     }
                                     if app.thok.has_finished() {
@@ -321,12 +323,16 @@ enum TimerCommand {
     Stop,
 }
 
-fn get_thok_events() -> (mpsc::Receiver<ThokEvent>, mpsc::Sender<TimerCommand>) {
+fn get_thok_events() -> (
+    mpsc::Receiver<ThokEvent>,
+    mpsc::Sender<TimerCommand>,
+    thread::JoinHandle<()>,
+) {
     let (event_tx, event_rx) = mpsc::channel();
     let (timer_tx, timer_rx) = mpsc::channel();
 
     let timer_events = event_tx.clone();
-    thread::spawn(move || {
+    let timer_thread = thread::spawn(move || {
         let mut active_timer = None;
 
         loop {
@@ -373,7 +379,7 @@ fn get_thok_events() -> (mpsc::Receiver<ThokEvent>, mpsc::Sender<TimerCommand>) 
         }
     });
 
-    (event_rx, timer_tx)
+    (event_rx, timer_tx, timer_thread)
 }
 
 fn ui<B: Backend>(app: &mut App, f: &mut Frame<B>) {
